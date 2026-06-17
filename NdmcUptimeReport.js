@@ -465,9 +465,14 @@ async function buildZoneRows(zone, dateRange) {
         const f = Number((eRounded - g).toFixed(4));
         const i_uptime = eRounded ? Number((f / eRounded).toFixed(6)) : 0;
 
-        const j = Number((expectedKwh.get(id) || 0).toFixed(4));
-        const k = Number((actualKwh.get(id)   || 0).toFixed(4));
-        const l_kwh = j ? Number((k / j).toFixed(6)) : 0;
+        // J Desired kWh: use the Uptime API value; if it comes back 0, fall back to
+        // D × E (Connected Load KW × Expected hours = desired kWh).
+        const jApi = Number((expectedKwh.get(id) || 0).toFixed(4));
+        const j = jApi !== 0 ? jApi : Number((d * eRounded).toFixed(4));
+        // K Actual kWh = Desired kWh × Uptime% (replaces the API's actual_kwh).
+        const k = Number((j * i_uptime).toFixed(4));
+        // L Actual kWh % = Uptime% (since K/J = (J×I)/J = I).
+        const l_kwh = i_uptime;
 
         return [i + 1, id, month, d, eRounded, f, g, h, i_uptime, j, k, l_kwh];
     });
