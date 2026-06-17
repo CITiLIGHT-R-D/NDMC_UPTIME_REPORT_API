@@ -73,7 +73,7 @@ const HEADERS = [
     "Total On Hours",
     "Start Time",
     "End Time",
-    "Output OFF",
+    "Output OFF Duration",
     "Total Off Hours",
     "Expected ON Hour",
     "Uptime %",
@@ -202,12 +202,14 @@ function pickField(obj, candidates) {
 }
 
 // Seconds → "HH:MM:SS". Also accepts a numeric string. Anything already containing
-// ":" (already formatted by the API) is passed through untouched.
-function formatDuration(v) {
+// ":" (already formatted by the API) is passed through untouched. With
+// { blankZero:true } a value of 0 renders blank (used for Output OFF).
+function formatDuration(v, { blankZero = false } = {}) {
     if (v === undefined || v === null || v === "") return "";
     if (typeof v === "string" && v.includes(":")) return v;
     const n = Number(v);
     if (!Number.isFinite(n)) return String(v);
+    if (blankZero && n === 0) return "";
     const total = Math.round(n);
     const h = Math.floor(total / 3600);
     const m = Math.floor((total % 3600) / 60);
@@ -216,11 +218,17 @@ function formatDuration(v) {
     return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
-// Timestamps/dates from the API are already strings ("2026/02/01 00:00:00"); just
-// stringify. (If a column ever arrives as an epoch number we still show it raw.)
-function formatTimestamp(v) {
+// Epoch seconds → IST (UTC+5:30) "YYYY/MM/DD HH:MM:SS". Null/blank → "".
+// (starttime/endtime/powercut_* arrive as Unix-epoch seconds.) Shifting by 19800s
+// then reading the UTC parts makes the result independent of the machine timezone.
+function formatEpoch(v) {
     if (v === undefined || v === null || v === "") return "";
-    return String(v);
+    const n = Number(v);
+    if (!Number.isFinite(n)) return String(v);
+    const d = new Date((n + 19800) * 1000);
+    const p = (x) => String(x).padStart(2, "0");
+    return `${d.getUTCFullYear()}/${p(d.getUTCMonth() + 1)}/${p(d.getUTCDate())} `
+         + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
 // "2026-02-01T..." / "2026/02/01 00:00:00" → "2026-02-01".
@@ -303,19 +311,22 @@ function chunkDateRange(startDate, endDate, chunkDays) {
 // script). For everything else we try several candidate keys, and DEBUG prints the
 // real keys of the first row so any unmapped column can be fixed in one place.
 // ----------------------------------------------------------------------------
+// Confirmed from the live detailed-view response (see probe output 2026-06):
+//   starttime/endtime/powercut_* = epoch seconds; actual_on/off_seconds, expected_on,
+//   output_off = duration seconds; ontime/offtime are epochs (NOT durations) — unused.
 const FIELD = {
-    switchPoint:   ["device_name", "name", "ccms_no", "ccmsNo", "deviceName"],
-    location:      ["location", "switch_location", "deviceLocation", "address", "switchLocation"],
-    date:          ["updated_on", "updatedon", "date", "day", "report_date"],
-    onStart:       ["starttime", "start_time", "on_start_time", "onStartTime", "ontime_start"],
-    onEnd:         ["endtime", "end_time", "on_end_time", "onEndTime", "ontime_end"],
-    totalOn:       ["ontime", "on_time", "total_on", "totalon", "actual_on", "actual_on_seconds", "total_on_hours"],
-    offStart:      ["powercut_starttime", "powercutstart", "pc_start", "off_start_time", "output_off_starttime"],
-    offEnd:        ["powercut_endtime", "powercutend", "pc_end", "off_end_time", "output_off_endtime"],
-    outputOff:     ["output_off", "outputoff", "powercutseconds", "powercut_seconds"],
-    totalOff:      ["offtime", "off_time", "total_off", "totaloff", "actual_off", "actual_off_seconds", "total_off_hours"],
-    expectedOn:    ["expected_on", "expected_on_seconds", "expectedon", "expected_on_hours"],
-    uptime:        ["uptime", "uptimepercentage", "uptime_percent", "uptimePercent", "uptime_percentage"],
+    switchPoint:   ["device_name"],
+    location:      ["switch_location", "location"],
+    date:          ["updated_on"],
+    onStart:       ["starttime"],
+    onEnd:         ["endtime"],
+    totalOn:       ["actual_on_seconds"],
+    offStart:      ["powercut_start"],
+    offEnd:        ["powercut_end"],
+    outputOff:     ["output_off"],
+    totalOff:      ["actual_off_seconds"],
+    expectedOn:    ["expected_on"],
+    uptime:        ["uptime"],
 };
 
 // Build one Excel row [A..L] from a raw operational detail record. liveLoc is the
@@ -327,12 +338,12 @@ function toRow(r, liveLoc) {
         sp ?? "",
         loc ?? "",
         formatDate(pickField(r, FIELD.date)),
-        formatTimestamp(pickField(r, FIELD.onStart)),
-        formatTimestamp(pickField(r, FIELD.onEnd)),
+        formatEpoch(pickField(r, FIELD.onStart)),
+        formatEpoch(pickField(r, FIELD.onEnd)),
         formatDuration(pickField(r, FIELD.totalOn)),
-        formatTimestamp(pickField(r, FIELD.offStart)),
-        formatTimestamp(pickField(r, FIELD.offEnd)),
-        formatDuration(pickField(r, FIELD.outputOff)),
+        formatEpoch(pickField(r, FIELD.offStart)),
+        formatEpoch(pickField(r, FIELD.offEnd)),
+        formatDuration(pickField(r, FIELD.outputOff), { blankZero: true }),
         formatDuration(pickField(r, FIELD.totalOff)),
         formatDuration(pickField(r, FIELD.expectedOn)),
         toUptimeNumber(pickField(r, FIELD.uptime)),
@@ -364,9 +375,17 @@ async function fetchOperationalDetailed(cityId, startDate, endDate, chunkDays = 
             const sp    = pickField(r, FIELD.switchPoint);
             const date  = pickField(r, FIELD.date);
             const start = pickField(r, FIELD.onStart);
-            const end   = pickField(r, FIELD.onEnd);
             if (!sp) continue;
-            const key = `${sp}|${date}|${start}|${end}`;
+            // Collapse to one segment per (device, date, half-of-night): AM (after-
+            // midnight, starts before noon IST) and PM (evening). The API repeats each
+            // record many times; on a sunset/sunrise schedule-change day it returns TWO
+            // differing variants per half, so a start/end-based key keeps both and inflates
+            // the row count (~+2 rows per device on that day). Keeping the FIRST variant per
+            // half matches the manual report: 2 rows per device per day, and the pre-change
+            // (older-schedule) variant is kept on the transition day.
+            const startSec = Number(start);
+            const half = Number.isFinite(startSec) && ((startSec + 19800) % 86400) / 3600 >= 12 ? "PM" : "AM";
+            const key = `${sp}|${date}|${half}`;
             if (!byKey.has(key)) byKey.set(key, r);
         }
         totalRows += part.length;
