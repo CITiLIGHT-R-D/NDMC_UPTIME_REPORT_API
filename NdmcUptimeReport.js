@@ -2,6 +2,8 @@ const axios = require("axios");
 const ExcelJS = require("exceljs");
 const https = require("https");
 const readline = require("readline");
+const fs = require("fs");
+const path = require("path");
 
 // ============================================================================
 // CONFIG — change these three things each month before running
@@ -215,6 +217,17 @@ function reportDateRange() {
 }
 
 const reportFilename = () => `NDMC_UptimeReport_${MONTH_NAMES[REPORT_MONTH - 1]}${REPORT_YEAR}.xlsx`;
+
+// Every run's output goes into Reports/<Month><Year>/ — one folder per report month,
+// created automatically if it doesn't exist. Both the Uptime and the Operational report
+// for the same month land in the same folder. Returns the full path to write to.
+const REPORTS_ROOT = path.join(__dirname, "Reports");
+const monthFolderName = () => `${MONTH_NAMES[REPORT_MONTH - 1]}${REPORT_YEAR}`;
+function reportOutputPath() {
+    const dir = path.join(REPORTS_ROOT, monthFolderName());
+    fs.mkdirSync(dir, { recursive: true });   // recursive: no error if it already exists
+    return path.join(dir, reportFilename());
+}
 
 // "CCMS A009339" / "CCMS H017854" → "1703EP1R80009339" — drop A/H prefix letter,
 // pad numeric tail to 6 digits, prepend constant prefix.
@@ -465,9 +478,14 @@ async function buildZoneRows(zone, dateRange) {
         const f = Number((eRounded - g).toFixed(4));
         const i_uptime = eRounded ? Number((f / eRounded).toFixed(6)) : 0;
 
-        const j = Number((expectedKwh.get(id) || 0).toFixed(4));
-        const k = Number((actualKwh.get(id)   || 0).toFixed(4));
-        const l_kwh = j ? Number((k / j).toFixed(6)) : 0;
+        // J Desired kWh: use the Uptime API value; if it comes back 0, fall back to
+        // D × E (Connected Load KW × Expected hours = desired kWh).
+        const jApi = Number((expectedKwh.get(id) || 0).toFixed(4));
+        const j = jApi !== 0 ? jApi : Number((d * eRounded).toFixed(4));
+        // K Actual kWh = Desired kWh × Uptime% (replaces the API's actual_kwh).
+        const k = Number((j * i_uptime).toFixed(4));
+        // L Actual kWh % = Uptime% (since K/J = (J×I)/J = I).
+        const l_kwh = i_uptime;
 
         return [i + 1, id, month, d, eRounded, f, g, h, i_uptime, j, k, l_kwh];
     });
@@ -578,7 +596,7 @@ async function main() {
 
     // Write the workbook. If the target file is open in Excel (EBUSY), don't lose the
     // whole run — save to a fallback name and tell the user.
-    const filename = reportFilename();
+    const filename = reportOutputPath();   // Reports/<Month><Year>/NDMC_UptimeReport_....xlsx
     let written = filename;
     try {
         await workbook.xlsx.writeFile(filename);
