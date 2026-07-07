@@ -2,6 +2,8 @@ const axios = require("axios");
 const ExcelJS = require("exceljs");
 const https = require("https");
 const readline = require("readline");
+const fs = require("fs");
+const path = require("path");
 
 // ============================================================================
 // NDMC OPERATIONAL (DETAILED) REPORT
@@ -194,6 +196,17 @@ function reportDateRange() {
 }
 
 const reportFilename = () => `Operation_uptime_Reports_${MONTH_NAMES[REPORT_MONTH - 1]}${REPORT_YEAR}.xlsx`;
+
+// Every run's output goes into Reports/<Month><Year>/ — one folder per report month,
+// created automatically if it doesn't exist. Both the Uptime and the Operational report
+// for the same month land in the same folder. Returns the full path to write to.
+const REPORTS_ROOT = path.join(__dirname, "Reports");
+const monthFolderName = () => `${MONTH_NAMES[REPORT_MONTH - 1]}${REPORT_YEAR}`;
+function reportOutputPath() {
+    const dir = path.join(REPORTS_ROOT, monthFolderName());
+    fs.mkdirSync(dir, { recursive: true });   // recursive: no error if it already exists
+    return path.join(dir, reportFilename());
+}
 
 // First candidate key that has a usable (non-null) value wins.
 function pickField(obj, candidates) {
@@ -503,7 +516,7 @@ async function main() {
         }
     }
 
-    const filename = reportFilename();
+    const filename = reportOutputPath();   // Reports/<Month><Year>/Operation_uptime_Reports_....xlsx
     let written = filename;
     try {
         await workbook.xlsx.writeFile(filename);

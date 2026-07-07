@@ -15,9 +15,23 @@ It then computes the formula columns (F = E−G, I = F/E, L = K/J), applies the
 business rules, and writes the finished, fully-styled workbook (via **ExcelJS**) —
 no manual pivots or VLOOKUPs.
 
-**📘 For the complete reference** — tech stack, every library, the end-to-end data flow,
-API sources, column logic, Excel formatting, and all commands — see
-[`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md).
+## 📘 Documentation (start here for KT)
+
+Three focused guides in [`docs/`](docs/) — read them in order:
+
+| Doc | For | Covers |
+|---|---|---|
+| [`docs/01_TECHNICAL.md`](docs/01_TECHNICAL.md) | developers | how the code works, every API source, all column formulas & business rules |
+| [`docs/02_HOW_TO_USE.md`](docs/02_HOW_TO_USE.md) | anyone running it | step-by-step run guide, prompts, verify checklist, troubleshooting |
+| [`docs/03_FEATURES.md`](docs/03_FEATURES.md) | overview | full feature list (incl. the new monthly output folders) |
+
+> The older [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md) and [`RUN_GUIDE.md`](RUN_GUIDE.md)
+> remain as background references; the `docs/` set above is the current, complete source.
+
+## Where reports are saved
+
+Each run auto-creates `Reports\<Month><Year>\` and writes the report there — e.g.
+`Reports\Jun2026\NDMC_UptimeReport_Jun2026.xlsx`. Both reports for a month share one folder.
 
 ## Usage
 
