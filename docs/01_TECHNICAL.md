@@ -15,7 +15,7 @@ Two Node.js scripts log into the Citilight smartlight portal, pull street-light 
 | Script | Produces | Report Type |
 |---|---|---|
 | NdmcUptimeReport.js | NDMC_UptimeReport_&lt;Month&gt;&lt;Year&gt;.xlsx | Summary - one computed row per switch, with business columns (uptime %, kWh, etc.) |
-| NdmcOperationalReport.js | Operation_uptime_Reports_&lt;Month&gt;&lt;Year&gt;.xlsx | Detailed - the raw nightly on/off segments, one row per switch per night-half, no computed business columns |
+| NdmcOperationalReport.js | Operational Hour Report &lt;Month&gt; &lt;Year&gt;.xlsx | Operational hours - one row per switch per day, straight from the API, no computed business columns |
 
 Both scripts write into Reports/&lt;Month&gt;&lt;Year&gt;/.
 
@@ -55,8 +55,8 @@ Auth is automatic - the script POSTs username and password to /smartlight/login 
 |---|---|---|---|
 | 2 | SP | SP | SP |
 | 3 | CITY | City | City |
-| 4 | CIVIL LINES | Civil_Lines | Civil Line |
-| 5 | KAROL BAGH | Karol_Bagh | Karol Bhag |
+| 4 | CIVIL LINES | Civil_Lines | Civil Lines |
+| 5 | KAROL BAGH | Karol_Bagh | Karol Bagh |
 | 6 | NARELA | Narela | Narela |
 | 7 | ROHINI | Rohini | Rohini |
 
@@ -161,44 +161,50 @@ Some uptime calls need the device's EP1R8 id. If the live feed already gives a m
 
 ---
 
-## NdmcOperationalReport.js - The Detailed Report
+## NdmcOperationalReport.js - The Operational Hour Report
 
-Mirrors the manual Operation_uptime_Reports_&lt;Month&gt;&lt;Year&gt;.xlsx - raw nightly segments, no computed business columns. Reuses the same login, semaphore, and chunking code.
+Mirrors the manual "Operational Hour Report &lt;Month&gt; &lt;Year&gt;.xlsx" - one row per switch per day, no computed business columns. Reuses the same login, semaphore, and chunking code.
 
-### Columns (12, All Directly From the API)
+### Columns (8, All Directly From the API)
 
 ```
-A Switch Point | B Location | C Date | D Start Time | E End Time | F Total On Hours
-G Start Time | H End Time | I Output OFF | J Total Off Hours | K Expected ON Hour | L Uptime %
+A Switch Point Name | B Date | C Location | D On Hours
+E OFF Hours | F Output OFF Hours | G Expected ON Hour | H Uptime
 ```
+
+Layout rules, all verified against the reference April-2026 workbook:
+
+- Durations are HH:MM:SS **text**; Date is YYYY-MM-DD **text**.
+- No cell is ever left blank - a zero duration writes 00:00:00.
+- Uptime is a **fraction** (1 = 100%) carrying the "0%" number format, not the 100.00 the API returns.
+- Plain grid: bold header row only, no borders, fills, or freeze panes.
+- Invariants that hold on every row: `On + OFF = 24:00:00` and `Uptime = On / Expected`.
 
 ### Field Mapping - the FIELD Object
 
 Only device_name, updated_on, expected_on, and output_off are confirmed; the rest use candidate-key lists resolved by pickField. Confirmed types from the probe:
 
-- starttime / endtime / powercut_start / powercut_end -> Unix epoch seconds
-- actual_on_seconds / actual_off_seconds / expected_on / output_off -> duration seconds
+- actual_on_seconds / actual_off_seconds / expected_on / output_off -> duration seconds, stamped as **daily totals** on every copy of a device-day
+- starttime / endtime / powercut_start / powercut_end -> Unix epoch seconds; unused since the report has no timestamp columns
 
 ### Value Formatting Helpers
 
-- formatEpoch(v) - epoch seconds to IST (UTC+5:30) YYYY/MM/DD HH:MM:SS. Shifts by 19800 seconds then reads UTC parts, so it is independent of the machine's timezone.
-- formatDuration(v, {blankZero}) - seconds to HH:MM:SS; already-formatted strings pass through; {blankZero:true} renders 0 as blank (used for Output OFF).
+- formatDuration(v) - seconds to HH:MM:SS; already-formatted strings pass through; missing or zero renders 00:00:00 (never blank).
 - formatDate(v) - any date string to YYYY-MM-DD.
-- toUptimeNumber(v) - uptime as a 2-decimal number.
+- toUptimeFraction(v) - the API's percentage (100) divided by 100 to give the fraction (1) the "0%" format expects; missing renders 0.
 - Location fallback: if a row has no location, use the device-location map built from the live feed.
 
 ### De-Dup Rule (Important, Different From the Uptime Script)
 
-The detailed API repeats each record many times, and on a sunset/sunrise schedule-change day returns two differing variants per night-half. Rows are collapsed to one segment per (device, date, half-of-night), where half is AM (after-midnight, starts before noon IST) or PM (evening), keeping the first variant seen. This yields the manual file's 2 rows per device per day and keeps the pre-change variant on a transition day. Rows are then sorted by Switch Point, then Date, then Start Time.
+The detailed API repeats each device-day many times - once per half of the night, each copy repeated further - but the duration fields are daily totals stamped identically on every copy. Rows are collapsed to **one row per (device, date)**, keeping the first copy seen; summing would double every duration. On a sunset/sunrise schedule-change day the API returns differing variants, and keeping the first preserves the pre-change values, matching the manual file. Rows are then sorted by Switch Point, then Date.
 
 ---
 
 ## Excel Formatting (Both Scripts)
 
 - Uptime sheet: row 1 is a merged, bold, centered title; row 2 is bold, wrapped headers (height 95px so the long "Night Duration..." header never clips); rows 1-2 are frozen, with the body anchored at A3 so the header is not duplicated when scrolling.
-- Operational sheet: row 1 is bold headers, frozen; body starts at row 2.
-- Alignment: text columns left/center, numbers right; number formats use 0.00, and 0.00% for the percentage columns (Uptime I and L).
-- Thin black borders on every cell.
+- Operational sheet: a plain grid matching the manual file - row 1 bold headers, no borders, no fills, no freeze pane, default alignment; only column widths and Uptime's "0%" format are set.
+- Uptime sheet alignment: text columns left/center, numbers right; number formats use 0.00, and 0.00% for the percentage columns (Uptime I and L), with thin black borders on every cell.
 - EBUSY/EPERM guard: if the target file is open in Excel when writing, the script saves a "_NEW.xlsx" copy instead of crashing, and tells you to close Excel and rename it.
 - On Windows, the script auto-opens the finished file.
 
@@ -209,7 +215,7 @@ The detailed API repeats each record many times, and on a sunset/sunrise schedul
 | File | Purpose |
 |---|---|
 | NdmcUptimeReport.js | Summary generator - login, fetch, aggregate, compute A-L, style, write |
-| NdmcOperationalReport.js | Detailed generator - login, fetch raw segments, dedup, format, write |
+| NdmcOperationalReport.js | Operational-hour generator - login, fetch segments, dedup to one row per device-day, format, write |
 | run-report.bat | Double-click launcher for the Uptime report |
 | run-operational-report.bat | Double-click launcher for the Operational report |
 | probe.js | Quick portal connectivity check |

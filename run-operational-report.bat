@@ -1,9 +1,9 @@
 @echo off
-title NDMC Operational (Detailed) Report Generator
+title NDMC Operational Hour Report Generator
 cd /d "%~dp0"
 
 echo =========================================
-echo    NDMC Operational (Detailed) Report
+echo    NDMC Operational Hour Report
 echo =========================================
 echo.
 

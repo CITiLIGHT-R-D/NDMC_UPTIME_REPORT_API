@@ -13,7 +13,7 @@ Two reports, one per script:
 | Report | File It Creates | Saved Into |
 |---|---|---|
 | Uptime (summary, 1 row per switch) | NDMC_UptimeReport_&lt;Month&gt;&lt;Year&gt;.xlsx | Reports/&lt;Month&gt;&lt;Year&gt;/ |
-| Operational (detailed nightly segments) | Operation_uptime_Reports_&lt;Month&gt;&lt;Year&gt;.xlsx | Reports/&lt;Month&gt;&lt;Year&gt;/ |
+| Operational hours (one row per switch per day) | Operational Hour Report &lt;Month&gt; &lt;Year&gt;.xlsx | Reports/&lt;Month&gt;&lt;Year&gt;/ |
 
 Each has 6 sheets - one per NDMC zone (SP, City, Civil Lines, Karol Bagh, Narela, Rohini).
 
@@ -39,7 +39,7 @@ To make the Uptime (summary) report:
    ```
    Which month do you want the report for? Enter 1-12 (1=Jan ... 12=Dec): 5
    Which year? Press Enter for 2026:
-   Portal username: admin
+   Portal username: admin (or your username)
    Portal password: ********        (hidden as you type)
    ```
 4. It logs in, fetches all 6 zones (about 10-15 minutes), and opens the Excel automatically when done. The window stays open so you can read the summary - close it when finished.

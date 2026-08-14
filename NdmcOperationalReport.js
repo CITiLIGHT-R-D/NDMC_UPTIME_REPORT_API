@@ -6,16 +6,24 @@ const fs = require("fs");
 const path = require("path");
 
 // ============================================================================
-// NDMC OPERATIONAL (DETAILED) REPORT
+// NDMC OPERATIONAL HOUR REPORT
 // ----------------------------------------------------------------------------
-// Mirrors the manual "Operation_uptime_Reports_<Month><Year>.xlsx" file:
-// one workbook, one sheet per zone, and within each sheet the RAW detailed-view
-// rows from the operational endpoint (view:"2") — one row per device per
-// night-segment. No aggregation, no computed business columns. Columns:
+// Mirrors the manual "Operational Hour Report <Month> <Year>.xlsx" file:
+// one workbook, one sheet per zone, and within each sheet ONE ROW PER DEVICE
+// PER DAY from the operational endpoint (view:"2"). Columns:
 //
-//   A Switch Point | B Location | C Date | D Start Time | E End Time |
-//   F Total On Hours | G Start Time | H End Time | I Output OFF |
-//   J Total Off Hours | K Expected ON Hour | L Uptime %
+//   A Switch Point Name | B Date | C Location | D On Hours | E OFF Hours |
+//   F Output OFF Hours  | G Expected ON Hour  | H Uptime
+//
+// Layout notes (all verified against the reference April-2026 workbook):
+//   • Durations are "HH:MM:SS" TEXT; Date is "YYYY-MM-DD" TEXT.
+//   • No cell is ever left blank — a zero duration writes "00:00:00".
+//   • Uptime is a FRACTION (1 = 100%) shown with the "0%" number format.
+//   • Plain sheet: bold header row only, no borders/fills/freeze panes.
+//
+// The endpoint returns ~2 rows per device-day (one per half of the night) with
+// the DAILY totals stamped on every copy, so we keep the first row per
+// (device, date) rather than summing — see fetchOperationalDetailed().
 //
 // Reuses the same auto-login / concurrency / date-chunking approach as
 // NdmcUptimeReport.js. The only data call is the operational detailed view.
@@ -54,12 +62,12 @@ const REFERERS = {
     operational: `${BASE}/smartlight/operationalReport`,
 };
 
-// Tab order + names match the manual Operation_uptime_Reports workbook exactly.
+// Tab order + names match the manual "Operational Hour Report" workbook exactly.
 const ZONES = [
     { cityId: "2", cityName: "SP",          sheetName: "SP" },
     { cityId: "3", cityName: "CITY",        sheetName: "City" },
-    { cityId: "5", cityName: "KAROL BAGH",  sheetName: "Karol Bhag" },
-    { cityId: "4", cityName: "CIVIL LINES", sheetName: "Civil Line" },
+    { cityId: "4", cityName: "CIVIL LINES", sheetName: "Civil Lines" },
+    { cityId: "5", cityName: "KAROL BAGH",  sheetName: "Karol Bagh" },
     { cityId: "6", cityName: "NARELA",      sheetName: "Narela" },
     { cityId: "7", cityName: "ROHINI",      sheetName: "Rohini" },
 ];
@@ -67,18 +75,14 @@ const ZONES = [
 const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 const HEADERS = [
-    "Switch Point",
-    "Location",
+    "Switch Point Name",
     "Date",
-    "Start Time",
-    "End Time",
-    "Total On Hours",
-    "Start Time",
-    "End Time",
-    "Output OFF Duration",
-    "Total Off Hours",
+    "Location",
+    "On Hours",
+    "OFF Hours",
+    "Output OFF Hours",
     "Expected ON Hour",
-    "Uptime %",
+    "Uptime",
 ];
 
 const httpsAgent = new https.Agent({ keepAlive: false });
@@ -195,7 +199,10 @@ function reportDateRange() {
     };
 }
 
-const reportFilename = () => `Operation_uptime_Reports_${MONTH_NAMES[REPORT_MONTH - 1]}${REPORT_YEAR}.xlsx`;
+// Matches the manual file the portal produces, e.g. "Operational Hour Report April 2026.xlsx".
+const FULL_MONTH_NAMES = ["January","February","March","April","May","June",
+                          "July","August","September","October","November","December"];
+const reportFilename = () => `Operational Hour Report ${FULL_MONTH_NAMES[REPORT_MONTH - 1]} ${REPORT_YEAR}.xlsx`;
 
 // Every run's output goes into Reports/<Month><Year>/ — one folder per report month,
 // created automatically if it doesn't exist. Both the Uptime and the Operational report
@@ -214,34 +221,21 @@ function pickField(obj, candidates) {
     return undefined;
 }
 
-// Seconds → "HH:MM:SS". Also accepts a numeric string. Anything already containing
-// ":" (already formatted by the API) is passed through untouched. With
-// { blankZero:true } a value of 0 renders blank (used for Output OFF).
-function formatDuration(v, { blankZero = false } = {}) {
-    if (v === undefined || v === null || v === "") return "";
+// Seconds → "HH:MM:SS" TEXT. Also accepts a numeric string. Anything already
+// containing ":" (already formatted by the API) is passed through untouched.
+// A missing/zero value renders "00:00:00", never blank — the reference workbook
+// has no empty cells anywhere in the grid.
+function formatDuration(v) {
+    if (v === undefined || v === null || v === "") return "00:00:00";
     if (typeof v === "string" && v.includes(":")) return v;
     const n = Number(v);
     if (!Number.isFinite(n)) return String(v);
-    if (blankZero && n === 0) return "";
     const total = Math.round(n);
     const h = Math.floor(total / 3600);
     const m = Math.floor((total % 3600) / 60);
     const s = total % 60;
     const pad = (x) => String(x).padStart(2, "0");
     return `${pad(h)}:${pad(m)}:${pad(s)}`;
-}
-
-// Epoch seconds → IST (UTC+5:30) "YYYY/MM/DD HH:MM:SS". Null/blank → "".
-// (starttime/endtime/powercut_* arrive as Unix-epoch seconds.) Shifting by 19800s
-// then reading the UTC parts makes the result independent of the machine timezone.
-function formatEpoch(v) {
-    if (v === undefined || v === null || v === "") return "";
-    const n = Number(v);
-    if (!Number.isFinite(n)) return String(v);
-    const d = new Date((n + 19800) * 1000);
-    const p = (x) => String(x).padStart(2, "0");
-    return `${d.getUTCFullYear()}/${p(d.getUTCMonth() + 1)}/${p(d.getUTCDate())} `
-         + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
 // "2026-02-01T..." / "2026/02/01 00:00:00" → "2026-02-01".
@@ -325,49 +319,43 @@ function chunkDateRange(startDate, endDate, chunkDays) {
 // real keys of the first row so any unmapped column can be fixed in one place.
 // ----------------------------------------------------------------------------
 // Confirmed from the live detailed-view response (see probe output 2026-06):
-//   starttime/endtime/powercut_* = epoch seconds; actual_on/off_seconds, expected_on,
-//   output_off = duration seconds; ontime/offtime are epochs (NOT durations) — unused.
+//   actual_on/off_seconds, expected_on, output_off = duration seconds, and they are
+//   DAILY totals repeated on every copy of a device-day. starttime/endtime/powercut_*
+//   are epoch seconds — no longer used, the report has no timestamp columns.
 const FIELD = {
     switchPoint:   ["device_name"],
     location:      ["switch_location", "location"],
     date:          ["updated_on"],
-    onStart:       ["starttime"],
-    onEnd:         ["endtime"],
     totalOn:       ["actual_on_seconds"],
-    offStart:      ["powercut_start"],
-    offEnd:        ["powercut_end"],
     outputOff:     ["output_off"],
     totalOff:      ["actual_off_seconds"],
     expectedOn:    ["expected_on"],
     uptime:        ["uptime"],
 };
 
-// Build one Excel row [A..L] from a raw operational detail record. liveLoc is the
+// Build one Excel row [A..H] from a raw operational detail record. liveLoc is the
 // device→location map from the live feed, used when the row carries no location.
 function toRow(r, liveLoc) {
     const sp   = pickField(r, FIELD.switchPoint);
     const loc  = pickField(r, FIELD.location) ?? (sp ? liveLoc.get(String(sp)) : undefined);
     return [
         sp ?? "",
-        loc ?? "",
         formatDate(pickField(r, FIELD.date)),
-        formatEpoch(pickField(r, FIELD.onStart)),
-        formatEpoch(pickField(r, FIELD.onEnd)),
+        loc ?? "",
         formatDuration(pickField(r, FIELD.totalOn)),
-        formatEpoch(pickField(r, FIELD.offStart)),
-        formatEpoch(pickField(r, FIELD.offEnd)),
-        formatDuration(pickField(r, FIELD.outputOff), { blankZero: true }),
         formatDuration(pickField(r, FIELD.totalOff)),
+        formatDuration(pickField(r, FIELD.outputOff)),
         formatDuration(pickField(r, FIELD.expectedOn)),
-        toUptimeNumber(pickField(r, FIELD.uptime)),
+        toUptimeFraction(pickField(r, FIELD.uptime)),
     ];
 }
 
-// Uptime as a 2-decimal number (the sheet shows 100.00). Null/blank → "".
-function toUptimeNumber(v) {
-    if (v === undefined || v === null || v === "") return "";
+// Uptime as a FRACTION for the "0%" number format: the API reports a percentage
+// (100 = fully up), the sheet stores 1. Missing → 0, so no cell is left blank.
+function toUptimeFraction(v) {
+    if (v === undefined || v === null || v === "") return 0;
     const n = Number(v);
-    return Number.isFinite(n) ? Number(n.toFixed(2)) : String(v);
+    return Number.isFinite(n) ? n / 100 : String(v);
 }
 
 // Fetch the whole month of detailed rows for one city, de-duplicating exact repeats
@@ -385,20 +373,18 @@ async function fetchOperationalDetailed(cityId, startDate, endDate, chunkDays = 
         if (!firstRowKeys && part[0]) firstRowKeys = Object.keys(part[0]);
         for (let i = 0; i < part.length; i++) {
             const r = part[i];
-            const sp    = pickField(r, FIELD.switchPoint);
-            const date  = pickField(r, FIELD.date);
-            const start = pickField(r, FIELD.onStart);
+            const sp   = pickField(r, FIELD.switchPoint);
+            const date = pickField(r, FIELD.date);
             if (!sp) continue;
-            // Collapse to one segment per (device, date, half-of-night): AM (after-
-            // midnight, starts before noon IST) and PM (evening). The API repeats each
-            // record many times; on a sunset/sunrise schedule-change day it returns TWO
-            // differing variants per half, so a start/end-based key keeps both and inflates
-            // the row count (~+2 rows per device on that day). Keeping the FIRST variant per
-            // half matches the manual report: 2 rows per device per day, and the pre-change
-            // (older-schedule) variant is kept on the transition day.
-            const startSec = Number(start);
-            const half = Number.isFinite(startSec) && ((startSec + 19800) % 86400) / 3600 >= 12 ? "PM" : "AM";
-            const key = `${sp}|${date}|${half}`;
+            // ONE row per (device, date). The endpoint repeats each device-day many
+            // times — once per half of the night, each copy repeated further — but
+            // actual_on/off_seconds, output_off and expected_on are DAILY totals
+            // stamped identically on every copy. So we keep the FIRST copy rather than
+            // summing; summing would double every duration. On a sunset/sunrise
+            // schedule-change day the API returns differing variants, and keeping the
+            // first preserves the pre-change (older-schedule) values, matching the
+            // manual report.
+            const key = `${sp}|${date}`;
             if (!byKey.has(key)) byKey.set(key, r);
         }
         totalRows += part.length;
@@ -424,56 +410,46 @@ async function buildZoneRows(zone, dateRange) {
         console.log("  >>> operational detail row KEYS:", agg.firstRowKeys);
         if (agg.rows[0]) console.log("  >>> operational detail row SAMPLE:", JSON.stringify(agg.rows[0]).slice(0, 600));
     }
-    console.log(`  operational: ${agg.totalRows} raw rows → ${agg.uniqueRows} unique segments (${agg.failedChunks} failed chunks)`);
+    console.log(`  operational: ${agg.totalRows} raw rows → ${agg.uniqueRows} device-days (${agg.failedChunks} failed chunks)`);
 
-    // Build, then sort by Switch Point, then Date, then Start Time — matches the manual file.
+    // Build, then sort by Switch Point, then Date — matches the manual file.
     const rows = agg.rows.map(r => toRow(r, liveLoc));
     rows.sort((a, b) =>
         String(a[0]).localeCompare(String(b[0])) ||
-        String(a[2]).localeCompare(String(b[2])) ||
-        String(a[3]).localeCompare(String(b[3]))
+        String(a[1]).localeCompare(String(b[1]))
     );
     return rows;
 }
 
 // ----------------------------------------------------------------------------
-// Excel layout (12 columns, matching the manual Operation_uptime_Reports file)
+// Excel layout (8 columns, matching the manual "Operational Hour Report" file).
+// Widths are copied verbatim from the reference workbook's SP sheet. The
+// reference is a plain grid — no borders, no fills, no freeze pane, default
+// alignment — so we only set widths, the bold header, and Uptime's "0%" format.
 // ----------------------------------------------------------------------------
 const COLUMN_SPEC = [
-    { width: 16, align: "left"   },   // A  Switch Point
-    { width: 46, align: "left"   },   // B  Location
-    { width: 12, align: "center" },   // C  Date
-    { width: 20, align: "center" },   // D  Start Time
-    { width: 20, align: "center" },   // E  End Time
-    { width: 14, align: "center" },   // F  Total On Hours
-    { width: 14, align: "center" },   // G  Start Time
-    { width: 14, align: "center" },   // H  End Time
-    { width: 12, align: "center" },   // I  Output OFF
-    { width: 14, align: "center" },   // J  Total Off Hours
-    { width: 14, align: "center" },   // K  Expected ON Hour
-    { width: 10, align: "right", numFmt: "0.00" },   // L  Uptime %
+    { width: 22.14 },                  // A  Switch Point Name
+    { width: 13    },                  // B  Date
+    { width: 52    },                  // C  Location
+    { width: 10.43 },                  // D  On Hours
+    { width: 11.71 },                  // E  OFF Hours
+    { width: 20.86 },                  // F  Output OFF Hours
+    { width: 20.86 },                  // G  Expected ON Hour
+    { width: 9.14, numFmt: "0%" },     // H  Uptime (fraction: 1 = 100%)
 ];
 
-const THIN = { style: "thin", color: { argb: "FF000000" } };
-const ALL_BORDERS = { top: THIN, left: THIN, bottom: THIN, right: THIN };
 const NCOLS = COLUMN_SPEC.length;
 
 function buildSheet(workbook, zone, rows) {
-    const ws = workbook.addWorksheet(zone.sheetName, {
-        views: [{ state: "frozen", xSplit: 0, ySplit: 1, topLeftCell: "A2", activeCell: "A2" }],
-    });
+    const ws = workbook.addWorksheet(zone.sheetName);
 
     COLUMN_SPEC.forEach((spec, i) => { ws.getColumn(i + 1).width = spec.width; });
 
-    // Row 1: bold header.
+    // Row 1: bold header, otherwise unstyled.
     ws.addRow(HEADERS);
-    const headerRow = ws.getRow(1);
-    headerRow.height = 28;
-    headerRow.eachCell({ includeEmpty: true }, (cell, c) => {
+    ws.getRow(1).eachCell({ includeEmpty: true }, (cell, c) => {
         if (c > NCOLS) return;
         cell.font = { bold: true };
-        cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
-        cell.border = ALL_BORDERS;
     });
 
     for (const r of rows) {
@@ -481,9 +457,7 @@ function buildSheet(workbook, zone, rows) {
         row.eachCell({ includeEmpty: true }, (cell, c) => {
             if (c > NCOLS) return;
             const spec = COLUMN_SPEC[c - 1];
-            cell.alignment = { horizontal: spec.align, vertical: "middle" };
             if (spec.numFmt && typeof cell.value === "number") cell.numFmt = spec.numFmt;
-            cell.border = ALL_BORDERS;
         });
     }
     return ws;
@@ -491,7 +465,7 @@ function buildSheet(workbook, zone, rows) {
 
 async function main() {
     console.log("=========================================");
-    console.log("   NDMC Operational (Detailed) Report");
+    console.log("   NDMC Operational Hour Report");
     console.log("=========================================\n");
 
     await ensureReportPeriod();
@@ -516,7 +490,7 @@ async function main() {
         }
     }
 
-    const filename = reportOutputPath();   // Reports/<Month><Year>/Operation_uptime_Reports_....xlsx
+    const filename = reportOutputPath();   // Reports/<Month><Year>/Operational Hour Report <Month> <Year>.xlsx
     let written = filename;
     try {
         await workbook.xlsx.writeFile(filename);
