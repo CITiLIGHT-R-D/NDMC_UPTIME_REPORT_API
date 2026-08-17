@@ -21,6 +21,10 @@ const nodemailer = require("nodemailer");
 const fs = require("fs");
 const path = require("path");
 
+// Pull config.env in when run by hand; run-monthly.ps1 has already set these,
+// and real environment variables take precedence either way.
+require("./load-config").loadConfig({ quiet: true });
+
 const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const FULL_MONTH_NAMES = ["January","February","March","April","May","June",
                           "July","August","September","October","November","December"];

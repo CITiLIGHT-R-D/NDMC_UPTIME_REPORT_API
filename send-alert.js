@@ -13,6 +13,8 @@ const nodemailer = require("nodemailer");
 const fs = require("fs");
 const path = require("path");
 
+require("./load-config").loadConfig({ quiet: true });
+
 const FULL_MONTH_NAMES = ["January","February","March","April","May","June",
                           "July","August","September","October","November","December"];
 
