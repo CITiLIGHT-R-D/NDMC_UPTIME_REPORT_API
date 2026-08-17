@@ -14,6 +14,13 @@ node_modules/
 # restarting). Safe to delete any time — it just forces a clean re-download.
 .cache/
 
+# Portal credentials for the scheduled job — NEVER commit. Only the .example is tracked.
+config.env
+
+# Scheduled-run logs and the single-run lock
+Logs/
+.run.lock
+
 # Background task output / logs
 *.output
 *.log

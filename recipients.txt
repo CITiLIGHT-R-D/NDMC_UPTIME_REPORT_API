@@ -1,0 +1,10 @@
+# Who receives the NDMC monthly reports.
+#
+# One email address per line. Lines starting with # are ignored, so you can
+# comment someone out instead of deleting them. Blank lines are fine.
+#
+# Changes take effect on the NEXT run — nothing to restart, no code to touch.
+# To see exactly what will be used without sending:  node send-report.js --dry-run
+
+aditi.mishra@citilight.co
+sanjay.cherukat@citilight.co

@@ -161,8 +161,20 @@ async function login(username, password) {
     return sid;
 }
 
+// True when nobody can type an answer — a scheduled task, cron, or any piped run.
+// Every prompt checks this first, because a blocked readline under Task Scheduler
+// hangs forever while holding a portal session open.
+const UNATTENDED = !process.stdin.isTTY || process.env.NDMC_UNATTENDED === "1";
+
 // Prompt for a line of input. With { hidden:true } the typed characters are masked.
 function ask(question, { hidden = false } = {}) {
+    if (UNATTENDED) {
+        throw new Error(
+            `Cannot prompt for "${question.trim()}" — this is an unattended run.\n` +
+            `  Set the value via environment variable instead:\n` +
+            `    NDMC_MONTH (1-12, or "last" for the previous month), NDMC_YEAR, NDMC_USER, NDMC_PASS`
+        );
+    }
     return new Promise((resolve) => {
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
         if (hidden) {
@@ -202,11 +214,33 @@ async function ensureSession() {
 
 // Resolve which month/year to report on: an explicit CUSTOM range wins; otherwise use
 // REPORT_MONTH/REPORT_YEAR if set, else prompt the user. Keeps asking until valid.
+// The month a scheduled run should report on: the one that just ended. Run on
+// 1–2 August and you get July; on 1–2 January you get December of the year before.
+function previousMonth() {
+    const now = new Date();
+    const m = now.getMonth();                       // 0-11 → already the previous month in 1-12 terms
+    return m === 0
+        ? { month: 12, year: now.getFullYear() - 1 }
+        : { month: m,  year: now.getFullYear() };
+}
+
 async function ensureReportPeriod() {
     if (CUSTOM_START_DATE && CUSTOM_END_DATE) {
         console.log(`Using custom date range ${CUSTOM_START_DATE} → ${CUSTOM_END_DATE}`);
         return;
     }
+
+    // Unattended (scheduled) runs, or an explicit NDMC_MONTH=last, report on the
+    // month that just finished — so the monthly job needs no edit each month.
+    const wantsPrevious = String(process.env.NDMC_MONTH || "").toLowerCase() === "last";
+    if (!(REPORT_MONTH >= 1 && REPORT_MONTH <= 12) && (wantsPrevious || UNATTENDED)) {
+        const p = previousMonth();
+        REPORT_MONTH = p.month;
+        REPORT_YEAR  = Number(process.env.NDMC_YEAR) || p.year;
+        console.log(`Unattended run — reporting on the previous month: ${MONTH_NAMES[REPORT_MONTH - 1]} ${REPORT_YEAR}`);
+        return;
+    }
+
     while (!(REPORT_MONTH >= 1 && REPORT_MONTH <= 12)) {
         const m = await ask("Which month do you want the report for? Enter 1-12 (1=Jan … 12=Dec): ");
         REPORT_MONTH = Number(m);
