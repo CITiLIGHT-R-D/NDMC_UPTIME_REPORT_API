@@ -47,6 +47,24 @@ const POWER_FAILURE_SCATTER_GAP   = [15, 20];
 // (e.g. to 5) only if a full run shows no failed chunks.
 const MAX_CONCURRENCY = 3;
 
+// Days of data requested per API call. Smaller = smaller responses = far more
+// likely to survive a loaded portal, at the cost of more requests. The big zones
+// (Narela 884 switches, Rohini 961) are the ones that drop chunks; if a run keeps
+// losing chunks for those, drop this to 2 before touching MAX_CONCURRENCY.
+const CHUNK_DAYS = 4;
+
+// Safety net. A zone that lost chunks holds only PART of the month, and the old
+// behaviour was to log it and still report the zone "OK" — which is how the bad
+// July 2026 Rohini sheet (4 days out of 31) reached a finished report unnoticed.
+// With this true, any zone still missing a chunk after the recovery sweep is
+// marked FAILED and the run exits non-zero, so a partial report can't pass as good.
+const FAIL_ON_INCOMPLETE_ZONE = true;
+
+// Above this many switches a zone is treated as "heavy": its operational and uptime
+// downloads run one after the other rather than at the same time, so the two biggest
+// zones don't compete with each other for the portal's capacity.
+const HEAVY_ZONE_SWITCHES = 500;
+
 const DEBUG = true;
 
 // ============================================================================
@@ -286,18 +304,43 @@ function makeSemaphore(max) {
 
 const portalLimiter = makeSemaphore(MAX_CONCURRENCY);
 
+// axios failures from this portal often carry an EMPTY err.message (it drops the
+// connection mid-response rather than returning a clean error), which makes the
+// log useless. Assemble whatever detail is actually available.
+function describeError(err) {
+    const parts = [];
+    if (err.code) parts.push(err.code);
+    if (err.response) parts.push(`HTTP ${err.response.status}`);
+    if (err.message) parts.push(err.message);
+    if (!parts.length) parts.push(err.constructor ? err.constructor.name : "connection dropped");
+    return parts.join(" ");
+}
+
+// Attempts per request, and how long to wait before each retry. The portal
+// recovers slowly under load, so the waits grow — a flat 3s retry (the previous
+// behaviour) almost always failed again while the server was still saturated.
+const RETRY_BACKOFF_MS = [3000, 10000, 25000, 45000];
+
 async function postWithRetry(url, body, referer, label) {
     const headers = makeHeaders(referer);
     const opts = { headers, httpsAgent, timeout: 300000 };
     await portalLimiter.acquire();
     try {
-        try {
-            return (await axios.post(url, body, opts)).data;
-        } catch (err) {
-            console.log(`    [retry] ${label}: ${err.message}`);
-            await new Promise(r => setTimeout(r, 3000));
-            return (await axios.post(url, body, opts)).data;
+        let lastErr;
+        for (let attempt = 0; attempt <= RETRY_BACKOFF_MS.length; attempt++) {
+            try {
+                return (await axios.post(url, body, opts)).data;
+            } catch (err) {
+                lastErr = err;
+                if (attempt === RETRY_BACKOFF_MS.length) break;
+                const wait = RETRY_BACKOFF_MS[attempt];
+                console.log(`    [retry ${attempt + 1}/${RETRY_BACKOFF_MS.length}] ${label}: ${describeError(err)} — waiting ${wait / 1000}s`);
+                // The semaphore slot is deliberately held across the wait: that
+                // throttles total pressure while the portal is recovering.
+                await new Promise(r => setTimeout(r, wait));
+            }
         }
+        throw lastErr;
     } finally {
         portalLimiter.release();
     }
@@ -324,6 +367,85 @@ const fetchUptimeSingle = (cityId, startDate, endDate, deviceArray) => postWithR
     "uptime",
 );
 
+// ----------------------------------------------------------------------------
+// CHECKPOINT STORE — makes a failed run cheap to retry.
+// ----------------------------------------------------------------------------
+// Every chunk that downloads successfully is written to .cache/<Month><Year>/ as
+// a small JSON file holding that chunk's TOTALS (never the raw rows — the portal
+// repeats each record ~94×, so a single raw chunk can be ~300 MB, while its
+// totals are a few dozen KB).
+//
+// On the next run any chunk already on disk is skipped, so a re-run fetches ONLY
+// what is still missing:
+//     run 1  →  5 of 8 chunks land, 3 fail    (~15 min)
+//     run 2  →  skips 5, retries 3            (~2 min)  ✅ complete
+//
+// IMPORTANT — this does not change any number in the report. A chunk's cached
+// totals are exactly what the original in-memory loop would have produced for
+// that chunk, and chunks cover non-overlapping date ranges, so summing them
+// gives the identical result. Delete .cache/ any time to force a clean re-fetch.
+const CACHE_ROOT = path.join(__dirname, ".cache");
+
+function cacheDir() {
+    const dir = path.join(CACHE_ROOT, monthFolderName());
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
+
+// One file per (endpoint, zone, chunk). CHUNK_DAYS is not in the name: chunk
+// boundaries are already encoded by sd/ed, so changing the chunk size simply
+// produces different files rather than silently reusing mismatched ones.
+const cachePath = (kind, cityId, sd, ed) =>
+    path.join(cacheDir(), `${kind}-city${cityId}-${sd}_${ed}.json`);
+
+function cacheRead(kind, cityId, sd, ed) {
+    const p = cachePath(kind, cityId, sd, ed);
+    if (!fs.existsSync(p)) return null;
+    try {
+        return JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch {
+        fs.unlinkSync(p);      // corrupt (e.g. killed mid-write) — treat as missing
+        return null;
+    }
+}
+
+// Write via a temp file + rename so an interrupted run can never leave a
+// half-written checkpoint that later reads as valid.
+function cacheWrite(kind, cityId, sd, ed, payload) {
+    const p = cachePath(kind, cityId, sd, ed);
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload), "utf8");
+    fs.renameSync(tmp, p);
+}
+
+// ----------------------------------------------------------------------------
+// Adaptive chunk sizing — the real cure for the failed downloads.
+// ----------------------------------------------------------------------------
+// Response size scales with switches × days × the portal's ~94× row duplication.
+// A flat 4 days meant SP sent ~50k rows while Narela sent ~332k and collapsed.
+// Target a roughly constant rows-per-request instead, so every zone sends a
+// comparable, survivable payload.
+// Rows in a response ≈ switches × days × ~94 (the portal's duplication factor), so
+// ~1000 switch-days keeps a request near ~100k rows — comfortably receivable. This
+// puts the two big zones on 1 day per request, which is exactly where they were
+// failing; small zones stay at the CHUNK_DAYS cap and lose no speed.
+//   SP 133 → 4d   City 143 → 4d   Karol Bagh 341 → 2d
+//   Civil Lines 823 → 1d   Narela 884 → 1d   Rohini 961 → 1d
+const TARGET_SWITCH_DAYS_PER_CHUNK = 1000;
+
+function chunkDaysForZone(switchCount) {
+    if (!switchCount) return CHUNK_DAYS;
+    const days = Math.floor(TARGET_SWITCH_DAYS_PER_CHUNK / switchCount);
+    return Math.max(1, Math.min(CHUNK_DAYS, days));
+}
+
+// Inclusive day count between two "YYYY-MM-DD" dates.
+function daysInRange(startDate, endDate) {
+    const a = new Date(startDate + "T00:00:00Z");
+    const b = new Date(endDate + "T00:00:00Z");
+    return Math.round((b - a) / 86400000) + 1;
+}
+
 // Walk [startDate, endDate] in chunks of `chunkDays` days (inclusive). Returns array of {sd, ed}.
 function chunkDateRange(startDate, endDate, chunkDays) {
     const out = [];
@@ -345,7 +467,7 @@ function chunkDateRange(startDate, endDate, chunkDays) {
 // as each chunk resolves. Never accumulates raw rows across chunks — at most
 // MAX_CONCURRENCY chunk responses exist at once, then each is freed after its sync
 // aggregation loop. Avoids V8 stack overflow (no spread) and Node string-size limits.
-async function fetchOperationalAggregated(cityId, startDate, endDate, chunkDays = 4) {
+async function fetchOperationalAggregated(cityId, startDate, endDate, chunkDays = CHUNK_DAYS) {
     const chunks = chunkDateRange(startDate, endDate, chunkDays);
     const expectedSec     = new Map();
     const powerFailureSec = new Map();
@@ -354,55 +476,170 @@ async function fetchOperationalAggregated(cityId, startDate, endDate, chunkDays 
     // every copy, so we must count each (switch, day) ONCE — otherwise E and G inflate
     // ~168×. seenDay tracks which switch-days we've already added.
     const seenDay = new Set();
-    let firstRowKeys = null, totalRows = 0, dedupRows = 0, failedChunks = 0;
-    await Promise.all(chunks.map(async ({ sd, ed }) => {
-        console.log(`    op chunk ${sd} → ${ed}`);
-        let part;
-        try { part = await fetchOperationalSingle(cityId, sd, ed); }
-        catch (err) { console.log(`      op chunk ${sd} failed: ${err.message}`); failedChunks++; return; }
-        if (!Array.isArray(part)) { failedChunks++; return; }
+    let firstRowKeys = null, totalRows = 0, dedupRows = 0;
+    const failed = [];
+    let fromCache = 0;
+
+    // Reduce ONE chunk's raw response to its unique switch-days. This is the
+    // original inner loop, unchanged, except the de-dup Set is per-chunk and the
+    // result is returned instead of added straight into the totals — so it can be
+    // cached. Chunks cover distinct dates, so this is equivalent.
+    const digest = (part) => {
+        if (!Array.isArray(part)) return null;
         if (!firstRowKeys && part[0]) firstRowKeys = Object.keys(part[0]);
+        const days = {};                       // "device|day" -> [expected_on, output_off]
         for (let i = 0; i < part.length; i++) {
             const r = part[i];
             const id = r.device_name;
             if (!id) continue;
             const key = `${id}|${r.updated_on}`;
-            if (seenDay.has(key)) continue;   // skip the duplicate copies of this switch-day
+            if (days[key]) continue;           // skip the duplicate copies of this switch-day
+            days[key] = [Number(r.expected_on) || 0, Number(r.output_off) || 0];
+        }
+        return { rawRows: part.length, days };
+    };
+
+    // Fold a chunk digest into the zone totals. The GLOBAL seenDay is kept so a
+    // switch-day appearing in two chunks is still counted once — identical to the
+    // original behaviour, and it makes re-absorbing a chunk harmless.
+    const merge = (d) => {
+        if (!d) return false;
+        totalRows += d.rawRows || 0;
+        for (const key of Object.keys(d.days)) {
+            if (seenDay.has(key)) continue;
             seenDay.add(key);
-            expectedSec.set(id,     (expectedSec.get(id)     || 0) + (Number(r.expected_on) || 0));
-            powerFailureSec.set(id, (powerFailureSec.get(id) || 0) + (Number(r.output_off)  || 0));
+            const id = key.slice(0, key.lastIndexOf("|"));
+            const [exp, off] = d.days[key];
+            expectedSec.set(id,     (expectedSec.get(id)     || 0) + exp);
+            powerFailureSec.set(id, (powerFailureSec.get(id) || 0) + off);
             dedupRows++;
         }
-        totalRows += part.length;
+        return true;
+    };
+
+    // Pass 1 — parallel, skipping anything already on disk from an earlier run.
+    await Promise.all(chunks.map(async (ch) => {
+        const cached = cacheRead("op", cityId, ch.sd, ch.ed);
+        if (cached) { merge(cached); fromCache++; return; }
+        console.log(`    op chunk ${ch.sd} → ${ch.ed}`);
+        let part;
+        try { part = await fetchOperationalSingle(cityId, ch.sd, ch.ed); }
+        catch (err) { console.log(`      op chunk ${ch.sd} failed: ${describeError(err)}`); failed.push(ch); return; }
+        const d = digest(part);
+        if (!d) { console.log(`      op chunk ${ch.sd} returned no array`); failed.push(ch); return; }
+        cacheWrite("op", cityId, ch.sd, ch.ed, d);
+        merge(d);
     }));
-    return { expectedSec, powerFailureSec, firstRowKeys, totalRows, dedupRows, failedChunks };
+
+    // Pass 2 — recovery sweep, ONE AT A TIME. The parallel pass fails mainly
+    // because the portal is saturated; retrying serially after a pause succeeds
+    // far more often than retrying inside the storm.
+    if (failed.length) {
+        console.log(`    ⟳ recovery sweep: ${failed.length} operational chunk(s), one at a time`);
+        await new Promise(r => setTimeout(r, 10000));
+        for (let i = failed.length - 1; i >= 0; i--) {
+            const ch = failed[i];
+            console.log(`      re-fetch op ${ch.sd} → ${ch.ed}`);
+            try {
+                const d = digest(await fetchOperationalSingle(cityId, ch.sd, ch.ed));
+                if (d) {
+                    cacheWrite("op", cityId, ch.sd, ch.ed, d);
+                    merge(d);
+                    failed.splice(i, 1);
+                    console.log(`        recovered`);
+                }
+            } catch (err) {
+                console.log(`        still failing: ${describeError(err)}`);
+            }
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+
+    if (fromCache) console.log(`    ↩ reused ${fromCache}/${chunks.length} operational chunk(s) from .cache`);
+
+    return { expectedSec, powerFailureSec, firstRowKeys, totalRows, dedupRows,
+             failedChunks: failed.length, totalChunks: chunks.length, fromCache };
 }
 
-async function fetchUptimeAggregated(cityId, startDate, endDate, deviceArray, chunkDays = 4) {
+async function fetchUptimeAggregated(cityId, startDate, endDate, deviceArray, chunkDays = CHUNK_DAYS) {
     const chunks = chunkDateRange(startDate, endDate, chunkDays);
     const expectedKwh = new Map();
     const actualKwh   = new Map();
-    let firstRowKeys = null, totalRows = 0, failedChunks = 0;
-    await Promise.all(chunks.map(async ({ sd, ed }) => {
-        console.log(`    up chunk ${sd} → ${ed}`);
-        let part;
-        try { part = await fetchUptimeSingle(cityId, sd, ed, deviceArray); }
-        catch (err) { console.log(`      up chunk ${sd} failed: ${err.message}`); failedChunks++; return; }
-        if (!Array.isArray(part)) { failedChunks++; return; }
+    let firstRowKeys = null, totalRows = 0;
+    const failed = [];
+    let fromCache = 0;
+
+    // Reduce ONE chunk to per-device kWh subtotals. Deliberately NO de-duplication:
+    // the original code summed every row the uptime endpoint returned, and adding a
+    // de-dup here would change the reported kWh. Per-day 2-decimal rounding happens
+    // before summing, exactly as before — the manual PivotTable sums the already-2dp
+    // exported values, so summing raw floats would drift (e.g. 501.37 vs 501.33).
+    const digest = (part) => {
+        if (!Array.isArray(part)) return null;
         if (!firstRowKeys && part[0]) firstRowKeys = Object.keys(part[0]);
+        const dev = {};                        // device -> [expectedKwh, actualKwh]
         for (let i = 0; i < part.length; i++) {
             const r = part[i];
             const id = r.device_name;
             if (!id) continue;
-            // Round each day to 2 decimals BEFORE summing, so the per-device total
-            // matches the manual pivot — which sums the already-2dp exported daily values,
-            // not the raw API floats. (Closes the ~0.04 gap, e.g. 501.37 → 501.33.)
-            expectedKwh.set(id, (expectedKwh.get(id) || 0) + Number((Number(r.expected_kwh) || 0).toFixed(2)));
-            actualKwh.set(id,   (actualKwh.get(id)   || 0) + Number((Number(r.actual_kwh)   || 0).toFixed(2)));
+            const cur = dev[id] || (dev[id] = [0, 0]);
+            cur[0] += Number((Number(r.expected_kwh) || 0).toFixed(2));
+            cur[1] += Number((Number(r.actual_kwh)   || 0).toFixed(2));
         }
-        totalRows += part.length;
+        return { rawRows: part.length, dev };
+    };
+
+    // Chunks cover distinct dates, so adding their subtotals equals summing every
+    // row once — the same total the original single-pass loop produced.
+    const merge = (d) => {
+        if (!d) return false;
+        totalRows += d.rawRows || 0;
+        for (const id of Object.keys(d.dev)) {
+            const [e, a] = d.dev[id];
+            expectedKwh.set(id, (expectedKwh.get(id) || 0) + e);
+            actualKwh.set(id,   (actualKwh.get(id)   || 0) + a);
+        }
+        return true;
+    };
+
+    await Promise.all(chunks.map(async (ch) => {
+        const cached = cacheRead("up", cityId, ch.sd, ch.ed);
+        if (cached) { merge(cached); fromCache++; return; }
+        console.log(`    up chunk ${ch.sd} → ${ch.ed}`);
+        let part;
+        try { part = await fetchUptimeSingle(cityId, ch.sd, ch.ed, deviceArray); }
+        catch (err) { console.log(`      up chunk ${ch.sd} failed: ${describeError(err)}`); failed.push(ch); return; }
+        const d = digest(part);
+        if (!d) { console.log(`      up chunk ${ch.sd} returned no array`); failed.push(ch); return; }
+        cacheWrite("up", cityId, ch.sd, ch.ed, d);
+        merge(d);
     }));
-    return { expectedKwh, actualKwh, firstRowKeys, totalRows, failedChunks };
+
+    if (failed.length) {
+        console.log(`    ⟳ recovery sweep: ${failed.length} uptime chunk(s), one at a time`);
+        await new Promise(r => setTimeout(r, 10000));
+        for (let i = failed.length - 1; i >= 0; i--) {
+            const ch = failed[i];
+            console.log(`      re-fetch up ${ch.sd} → ${ch.ed}`);
+            try {
+                const d = digest(await fetchUptimeSingle(cityId, ch.sd, ch.ed, deviceArray));
+                if (d) {
+                    cacheWrite("up", cityId, ch.sd, ch.ed, d);
+                    merge(d);
+                    failed.splice(i, 1);
+                    console.log(`        recovered`);
+                }
+            } catch (err) {
+                console.log(`        still failing: ${describeError(err)}`);
+            }
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+
+    if (fromCache) console.log(`    ↩ reused ${fromCache}/${chunks.length} uptime chunk(s) from .cache`);
+
+    return { expectedKwh, actualKwh, firstRowKeys, totalRows,
+             failedChunks: failed.length, totalChunks: chunks.length, fromCache };
 }
 
 async function buildZoneRows(zone, dateRange) {
@@ -429,16 +666,49 @@ async function buildZoneRows(zone, dateRange) {
 
     const deviceArray = switches.map(s => s.ep1r8Id || ccmsToEp1r8(s.switchId));
 
-    // Operational and uptime are independent — fetch them concurrently. Their chunks
-    // all share the single global MAX_CONCURRENCY budget via portalLimiter, so this
-    // overlaps the two endpoints without exceeding the safe in-flight cap.
-    const [opAgg, upAgg] = await Promise.all([
-        fetchOperationalAggregated(zone.cityId, dateRange.startDate, dateRange.endDate),
-        fetchUptimeAggregated(zone.cityId, dateRange.startDate, dateRange.endDate, deviceArray),
-    ]);
+    // Size each request to the zone. Response size scales with switches × days, so
+    // a flat 4 days made the big zones (Narela 884, Rohini 961) send ~330k rows and
+    // collapse, while small zones were nowhere near the limit.
+    const zoneChunkDays = chunkDaysForZone(switches.length);
+    console.log(`  chunk size: ${zoneChunkDays} day(s) per request (${switches.length} switches)`);
+
+    // Operational and uptime are independent — normally fetched concurrently. On the
+    // big zones that doubles the pressure exactly where it already breaks, so there
+    // they run one after the other instead.
+    const heavy = switches.length > HEAVY_ZONE_SWITCHES;
+    let opAgg, upAgg;
+    if (heavy) {
+        console.log(`  heavy zone — fetching operational and uptime sequentially`);
+        opAgg = await fetchOperationalAggregated(zone.cityId, dateRange.startDate, dateRange.endDate, zoneChunkDays);
+        upAgg = await fetchUptimeAggregated(zone.cityId, dateRange.startDate, dateRange.endDate, deviceArray, zoneChunkDays);
+    } else {
+        [opAgg, upAgg] = await Promise.all([
+            fetchOperationalAggregated(zone.cityId, dateRange.startDate, dateRange.endDate, zoneChunkDays),
+            fetchUptimeAggregated(zone.cityId, dateRange.startDate, dateRange.endDate, deviceArray, zoneChunkDays),
+        ]);
+    }
 
     if (DEBUG && opAgg.firstRowKeys) console.log("  opData[0] keys:", opAgg.firstRowKeys);
     console.log(`  operational: ${opAgg.totalRows} raw rows → ${opAgg.dedupRows} unique switch-days (${opAgg.failedChunks} failed chunks)`);
+
+    // Coverage check. Every switch should have one record per day of the month, so
+    // dedupRows ≈ switches × days. A shortfall means chunks were lost and the zone
+    // holds only part of the month — the exact defect behind the bad July Rohini sheet.
+    const expectedDays = daysInRange(dateRange.startDate, dateRange.endDate);
+    const coverage = switches.length * expectedDays
+        ? opAgg.dedupRows / (switches.length * expectedDays) : 0;
+    const capturedDays = switches.length ? opAgg.dedupRows / switches.length : 0;
+    console.log(`  coverage: ${(coverage * 100).toFixed(1)}% — ${capturedDays.toFixed(1)} of ${expectedDays} days per switch`);
+
+    if (opAgg.failedChunks || upAgg.failedChunks || coverage < 0.99) {
+        const why = [];
+        if (opAgg.failedChunks) why.push(`${opAgg.failedChunks}/${opAgg.totalChunks} operational chunks lost`);
+        if (upAgg.failedChunks) why.push(`${upAgg.failedChunks}/${upAgg.totalChunks} uptime chunks lost`);
+        if (coverage < 0.99)    why.push(`only ${capturedDays.toFixed(1)}/${expectedDays} days captured`);
+        const msg = `INCOMPLETE DATA — ${why.join("; ")}`;
+        console.log(`  ⚠️  ${msg}`);
+        if (FAIL_ON_INCOMPLETE_ZONE) throw new Error(msg);
+    }
     if (DEBUG && upAgg.firstRowKeys) console.log("  uptimeData[0] keys:", upAgg.firstRowKeys);
     console.log(`  uptime: ${upAgg.totalRows} daily rows (${upAgg.failedChunks} failed chunks)`);
 
@@ -615,6 +885,24 @@ async function main() {
     console.log("\n--- Summary ---");
     for (const s of summary) console.log(`  ${s.zone.padEnd(14)} ${String(s.switches).padStart(4)} switches  ${s.status}`);
     console.log(`\nWritten: ${written}`);
+
+    // A zone that failed leaves an EMPTY sheet in the workbook. Never let that pass
+    // as a finished report — say so loudly and exit non-zero.
+    const failedZones = summary.filter(s => s.status !== "OK");
+    if (failedZones.length) {
+        console.log(`\n${"!".repeat(70)}`);
+        console.log(`  ⚠️  THIS REPORT IS INCOMPLETE — DO NOT SEND IT`);
+        console.log(`  ${failedZones.length} of ${summary.length} zones failed:`);
+        for (const s of failedZones) console.log(`     • ${s.zone}: ${s.status}`);
+        console.log(`\n  Re-run for this month when the portal is under lighter load.`);
+        console.log(`  If the same zones keep failing, set CHUNK_DAYS = 2 (smaller requests)`);
+        console.log(`  and/or MAX_CONCURRENCY = 2 near the top of this file.`);
+        console.log(`${"!".repeat(70)}`);
+        process.exitCode = 1;
+        return;   // don't auto-open a report that shouldn't be used
+    }
+
+    console.log("\n✅ All zones complete. Verify with:  node check-completeness.js");
 
     // Open the finished report automatically (Windows).
     if (process.platform === "win32") {

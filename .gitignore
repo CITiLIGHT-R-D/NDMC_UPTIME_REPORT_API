@@ -10,6 +10,10 @@ node_modules/
 # Local archives / exports (e.g. a zipped copy of docs/ — the real files are tracked)
 *.zip
 
+# Download checkpoints (per-chunk totals so a failed run resumes instead of
+# restarting). Safe to delete any time — it just forces a clean re-download.
+.cache/
+
 # Background task output / logs
 *.output
 *.log
