@@ -31,3 +31,6 @@ Thumbs.db
 
 # Claude Code harness config
 .claude/
+
+# Scheduler state (which months have been completed)
+.scheduler-state.json
