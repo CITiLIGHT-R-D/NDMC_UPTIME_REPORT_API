@@ -1,4 +1,4 @@
-<#
+﻿<#
 ================================================================================
   NDMC MONTHLY REPORTS — unattended runner
 ================================================================================
@@ -95,7 +95,8 @@ try {
     if ($Month -ge 1 -and $Month -le 12) {
         $env:NDMC_MONTH = "$Month"
         if ($Year -ge 2000) { $env:NDMC_YEAR = "$Year" } else { Remove-Item env:NDMC_YEAR -ErrorAction SilentlyContinue }
-        Write-Log "Reporting on month $Month $(if ($Year -ge 2000) { $Year } else { '(current year)' }) (explicit)"
+        $yearLabel = if ($Year -ge 2000) { "$Year" } else { '(current year)' }
+        Write-Log "Reporting on month $Month $yearLabel (explicit)"
     } else {
         $env:NDMC_MONTH = 'last'
         Remove-Item env:NDMC_YEAR -ErrorAction SilentlyContinue

@@ -1,0 +1,4 @@
+# PowerShell scripts must keep a UTF-8 BOM: Windows PowerShell 5.1 reads
+# BOM-less files as ANSI, which mangles non-ASCII characters (an em dash
+# decodes into a stray quote) and breaks parsing.
+*.ps1 text working-tree-encoding=UTF-8 eol=crlf
