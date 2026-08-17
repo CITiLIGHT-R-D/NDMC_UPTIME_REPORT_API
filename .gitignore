@@ -7,6 +7,9 @@ node_modules/
 # Excel lock/temp files
 ~$*
 
+# Local archives / exports (e.g. a zipped copy of docs/ — the real files are tracked)
+*.zip
+
 # Background task output / logs
 *.output
 *.log
