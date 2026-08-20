@@ -31,6 +31,12 @@ const FULL_MONTH_NAMES = ["January","February","March","April","May","June",
 
 const DRY_RUN = process.argv.includes("--dry-run");
 
+// --test proves delivery really works end to end. It clearly labels the mail as a
+// test and, unlike a real send, allows an incomplete set through — so the email
+// path can be verified before both reports for a month exist. It never runs as
+// part of the scheduled job.
+const TEST_MODE = process.argv.includes("--test");
+
 // ---------------------------------------------------------------- period ----
 function resolvePeriod() {
     const args = process.argv.slice(2).filter(a => !a.startsWith("--"));
@@ -128,10 +134,14 @@ function buildHtml(month, year, files) {
         process.exit(1);
     }
     // Never quietly send a partial set — a missing file means the run had a problem.
-    if (present.length < files.length) {
+    if (present.length < files.length && !TEST_MODE) {
         console.error(`\n${files.length - present.length} report(s) missing for ${period}. Refusing to send an incomplete set.`);
         console.error(`Generate the missing report first, then re-run this.`);
+        console.error(`(To verify the email path anyway, add --test — it marks the mail as a test.)`);
         process.exit(1);
+    }
+    if (present.length < files.length) {
+        console.log(`  ! TEST MODE — sending an incomplete set (${present.length}/${files.length}); a real run would refuse.`);
     }
 
     const to = readRecipients();
@@ -139,8 +149,14 @@ function buildHtml(month, year, files) {
     console.log(`  to: ${to.join(", ")}`);
     if (cc.length) console.log(`  cc: ${cc.join(", ")}`);
 
-    const subject = `NDMC Monthly Reports — ${period}`;
-    const html = buildHtml(month, year, files);
+    const subject = (TEST_MODE ? "[TEST] " : "") + `NDMC Monthly Reports — ${period}`;
+    const html = (TEST_MODE
+        ? `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#fef3c7;border-left:4px solid #f59e0b;padding:12px 16px;margin:0 0 20px;font-size:13px;color:#78350f;">
+             <strong>This is a TEST email.</strong> It was sent by hand to confirm the monthly
+             delivery works. The real report goes out automatically on the 2nd of each month.
+             No action needed.
+           </div>`
+        : "") + buildHtml(month, year, files);
 
     if (DRY_RUN) {
         console.log(`\nDRY RUN — would send "${subject}" with ${present.length} attachment(s). Nothing was sent.`);

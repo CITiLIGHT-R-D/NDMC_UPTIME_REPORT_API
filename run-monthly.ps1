@@ -47,6 +47,118 @@ function Write-Log {
     Add-Content -Path $logFile -Value $line -Encoding utf8
 }
 
+# ------------------------------------------------------- keep-awake ----------
+# A full run takes hours. WakeToRun only wakes the machine to START the job - it
+# does nothing to stop Windows sleeping DURING it, which is exactly how the
+# 17 Aug 2026 test died: the PC slept at ~20:20 and every request then failed
+# with ENOTFOUND (DNS gone), part-way through the third zone.
+#
+# SetThreadExecutionState with ES_CONTINUOUS | ES_SYSTEM_REQUIRED tells Windows
+# this thread needs the system kept alive. The display is deliberately NOT held
+# on - the screen can still blank, the machine just must not sleep. Cleared
+# again in the finally block.
+#
+# NOT ENOUGH ON ITS OWN: this machine uses Modern Standby (S0ix), which
+# SetThreadExecutionState does NOT prevent - confirmed by Kernel-Power event 506
+# ("entering Modern Standby") landing exactly when two test runs died. So the
+# idle standby timeout is also set to "never" below, and restored afterwards.
+$keepAwake = $null
+try {
+    $sig = @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@
+    $keepAwake = Add-Type -MemberDefinition $sig -Name 'PowerMgmt' -Namespace 'Win32Native' -PassThru
+    # Write these as DECIMAL. In Windows PowerShell 5.1 the literal 0x80000000 is
+    # parsed as a signed Int32 first and overflows to -2147483648, so
+    # [uint32]0x80000000 throws - and keep-awake would silently never engage.
+    $ES_CONTINUOUS = [uint32]2147483648
+    $ES_SYSTEM_REQUIRED = [uint32]1
+    # ES_DISPLAY_REQUIRED matters MORE than ES_SYSTEM_REQUIRED on a Modern Standby
+    # machine: it enters connected standby when the DISPLAY turns off, regardless of
+    # the standby timeout. Holding the display on is what actually keeps the network
+    # alive. (Two runs died despite ES_SYSTEM_REQUIRED alone.)
+    $ES_DISPLAY_REQUIRED = [uint32]2
+    if ($keepAwake::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_DISPLAY_REQUIRED) -eq 0) {
+        Write-Log "Could not request keep-awake; the machine may sleep mid-run." 'WARN'
+        $keepAwake = $null
+    } else {
+        Write-Log "Keep-awake active - Windows will not sleep while this run is in progress."
+    }
+} catch {
+    Write-Log "Keep-awake unavailable ($($_.Exception.Message)); the machine may sleep mid-run." 'WARN'
+    $keepAwake = $null
+}
+
+# ------------------------------------------- suspend idle standby ------------
+# Modern Standby ignores SetThreadExecutionState, so the only reliable way to keep
+# a multi-hour run alive is to set the idle standby timeout to "never" while it
+# runs, then put the original values back.
+#
+# The originals are saved to .power-restore.json BEFORE anything is changed, and
+# only written if that file does not already exist - so a run that gets killed
+# cannot overwrite the real values with 0. The next run restores from it first.
+$powerMarker = Join-Path $PSScriptRoot '.power-restore.json'
+
+function Get-TimeoutPair {
+    param([string]$SubGroup, [string]$Setting)
+    $out = powercfg /q SCHEME_CURRENT $SubGroup $Setting 2>$null
+    $ac = $null; $dc = $null
+    foreach ($l in $out) {
+        if ($l -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $ac = [Convert]::ToInt32($Matches[1], 16) }
+        if ($l -match 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $dc = [Convert]::ToInt32($Matches[1], 16) }
+    }
+    if ($null -eq $ac -or $null -eq $dc) { return $null }
+    # powercfg reports SECONDS but /change takes MINUTES.
+    return @{ acMin = [int]($ac / 60); dcMin = [int]($dc / 60) }
+}
+
+# Both matter. On Modern Standby the MONITOR timeout is the one that actually
+# triggers connected standby, so it must be held off too.
+function Get-StandbyTimeouts {
+    $sleep   = Get-TimeoutPair 'SUB_SLEEP' 'STANDBYIDLE'
+    $monitor = Get-TimeoutPair 'SUB_VIDEO' 'VIDEOIDLE'
+    if (-not $sleep) { return $null }
+    return @{
+        acMin = $sleep.acMin; dcMin = $sleep.dcMin
+        monAcMin = if ($monitor) { $monitor.acMin } else { -1 }
+        monDcMin = if ($monitor) { $monitor.dcMin } else { -1 }
+    }
+}
+
+function Restore-StandbyTimeouts {
+    if (-not (Test-Path $powerMarker)) { return }
+    try {
+        $saved = Get-Content $powerMarker -Raw | ConvertFrom-Json
+        powercfg /change standby-timeout-ac $saved.acMin 2>$null | Out-Null
+        powercfg /change standby-timeout-dc $saved.dcMin 2>$null | Out-Null
+        if ($saved.monAcMin -ge 0) { powercfg /change monitor-timeout-ac $saved.monAcMin 2>$null | Out-Null }
+        if ($saved.monDcMin -ge 0) { powercfg /change monitor-timeout-dc $saved.monDcMin 2>$null | Out-Null }
+        Write-Log "Restored power timeouts (sleep AC $($saved.acMin)/DC $($saved.dcMin) min, screen AC $($saved.monAcMin)/DC $($saved.monDcMin) min)."
+    } catch {
+        Write-Log "Could not restore sleep timeouts: $_" 'WARN'
+    }
+    Remove-Item $powerMarker -Force -ErrorAction SilentlyContinue
+}
+
+# A previous run may have been killed before restoring - put things back first.
+Restore-StandbyTimeouts
+
+$orig = Get-StandbyTimeouts
+if ($orig) {
+    if (-not (Test-Path $powerMarker)) {
+        $orig | ConvertTo-Json | Set-Content -Path $powerMarker -Encoding utf8
+    }
+    powercfg /change standby-timeout-ac 0 2>$null | Out-Null
+    powercfg /change standby-timeout-dc 0 2>$null | Out-Null
+    # The screen timeout is the one that really triggers Modern Standby.
+    powercfg /change monitor-timeout-ac 0 2>$null | Out-Null
+    powercfg /change monitor-timeout-dc 0 2>$null | Out-Null
+    Write-Log "Sleep AND screen blanking disabled for this run (was sleep AC $($orig.acMin)/DC $($orig.dcMin) min, screen AC $($orig.monAcMin)/DC $($orig.monDcMin) min); restored when it ends."
+} else {
+    Write-Log "Could not read the current sleep timeouts - the machine may sleep mid-run." 'WARN'
+}
+
 # ------------------------------------------------------------------- lock ----
 # One run at a time, always. Two concurrent runs would double the load on a
 # portal that already fails at three simultaneous requests.
@@ -192,4 +304,10 @@ try {
 }
 finally {
     Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+    # Release the sleep block - ES_CONTINUOUS on its own clears the earlier request.
+    if ($keepAwake) {
+        try { [void]$keepAwake::SetThreadExecutionState([uint32]2147483648) } catch { }
+    }
+    # Always hand the machine's normal sleep behaviour back.
+    Restore-StandbyTimeouts
 }

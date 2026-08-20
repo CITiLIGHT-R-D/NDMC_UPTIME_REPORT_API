@@ -34,3 +34,6 @@ Thumbs.db
 
 # Scheduler state (which months have been completed)
 .scheduler-state.json
+
+# Saved sleep timeouts while a run has them disabled
+.power-restore.json
